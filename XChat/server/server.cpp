@@ -1,134 +1,85 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#pragma once
 
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <arpa/inet.h>
+#include <mutex>
+#include <algorithm>
 
-#include <unistd.h>
+#include <openssl/ssl.h>
 
-#include <vector>
-#include <thread>
+/* Server Bind config */
 
-#include "server.hpp"
+#define SERVER_ADDRESS "0.0.0.0"
+#define SERVER_PORT 8080
 
-int main(void){
-    std::mutex client_vector_mutex;
-    std::vector<Client> client_vector;
-    int server_socket; sockaddr_in server_address;
+/* Server Logic config */
+#define MAX_CLIENT 200
 
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = inet_addr(SERVER_ADDRESS);
-    server_address.sin_port = htons(SERVER_PORT);
+/* Communication config */
+#define USERNAME_SIZE 32
+#define MESSAGE_SIZE 1024
 
-    socklen_t sizeof_server_address = sizeof(server_address);
+/* Code config */
+#define CODE_SERVER_FULL "//FULL//"
 
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+class Client {
+    public:
+    char* username;
 
-    if(server_socket < 0){
-        return 1;
-    }
+    char* ip_address;
+    unsigned int port;
 
-    if(bind(server_socket, reinterpret_cast<sockaddr*>(&server_address), sizeof_server_address) < 0){
-        return 1;
-    }
+    int client_fd;
+    SSL* ssl_fd;
+};
 
-    if(listen(server_socket, 5) < 0){
-        return 1;
-    }
+void RemoveClient(std::vector<Client>& client_vector, int client_fd, std::mutex& client_vector_mutex) {
+    std::lock_guard<std::mutex> lock(client_vector_mutex);
 
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
+    client_vector.erase(
+        std::remove_if(client_vector.begin(), client_vector.end(),
+            [client_fd](const Client& client) {
+                return client.client_fd == client_fd;
+            }),
+        client_vector.end());
+}
 
-    const SSL_METHOD* ssl_method = SSLv23_server_method();
-    SSL_CTX* ssl_context = SSL_CTX_new(ssl_method);
+void ReadFromClient(SSL* ssl_fd, int client_fd, sockaddr_in client_address, char* username, std::mutex& client_vector_mutex, std::vector<Client>& client_vector){
+    {
+        std::lock_guard<std::mutex> lock(client_vector_mutex);
 
-    if(!ssl_context){
-        return 1;
-    }
+        Client new_client;
 
-    if (SSL_CTX_use_certificate_file(ssl_context, "keys/server.crt", SSL_FILETYPE_PEM) <= 0 || SSL_CTX_use_PrivateKey_file(ssl_context, "keys/server.key", SSL_FILETYPE_PEM) <= 0) {
-        return 1;
-    }
+        new_client.client_fd = client_fd;
+        new_client.ssl_fd = ssl_fd;
+        new_client.username = username;
+        new_client.ip_address = inet_ntoa(client_address.sin_addr);
+        new_client.port = ntohs(client_address.sin_port);
+
+        client_vector.push_back(new_client);  
+    }  
 
     while(true == true){
-        if(client_vector.size() >= MAX_CLIENT){
-            SSL* ssl_fd = SSL_new(ssl_context);
+        char message_buffer[MESSAGE_SIZE];
 
-            if(!ssl_fd){
-                SSL_free(ssl_fd);
-                continue;
-            }
+        int received_bytes = SSL_read(ssl_fd, message_buffer, MESSAGE_SIZE - 1);
 
-            sockaddr_in client_address;
-            socklen_t client_address_size;
-            int client_fd = accept(server_socket, reinterpret_cast<sockaddr*>(&client_address), &client_address_size);
-
-            if(client_fd < 0){
-                SSL_free(ssl_fd);
-                close(client_fd);
-                continue;
-            }
-
-            char username_buffer[USERNAME_SIZE];
-            int recevied_bytes = SSL_read(ssl_fd, username_buffer, USERNAME_SIZE - 1);
-
-            if(recevied_bytes <= 0){
-                SSL_free(ssl_fd);
-                close(client_fd);
-                continue;
-            }
-
-            username_buffer[recevied_bytes] = '\0';
-
-            SSL_write(ssl_fd, CODE_SERVER_FULL, strlen(CODE_SERVER_FULL));
-
-            SSL_free(ssl_fd);
-            close(client_fd);
+        if(received_bytes <= 0){
             continue;
         }
         else{
-            SSL* ssl_fd = SSL_new(ssl_context);
+            message_buffer[received_bytes] = '\0';
 
-            if(!ssl_fd){
-                SSL_free(ssl_fd);
-                continue;
+            {
+                std::lock_guard<std::mutex> lock(client_vector_mutex);
+
+                for(const auto& client : client_vector){
+                    SSL_write(client.ssl_fd, message_buffer, MESSAGE_SIZE);
+                }
             }
-
-            sockaddr_in client_address;
-            socklen_t client_address_size;
-            int client_fd = accept(server_socket, reinterpret_cast<sockaddr*>(&client_address), &client_address_size);
-
-            if(client_fd < 0){
-                close(client_fd);
-                continue;
-            }
-
-            SSL_set_fd(ssl_fd, client_fd);
-
-            if(SSL_accept(ssl_fd) < 0 ){
-                SSL_free(ssl_fd);
-                close(client_fd);
-                continue;
-            }
-
-            char username_buffer[USERNAME_SIZE];
-
-            int received_bytes = SSL_read(ssl_fd, username_buffer, USERNAME_SIZE - 1);
-
-            if(received_bytes <= 0){
-                SSL_free(ssl_fd);
-                close(client_fd);
-                continue;
-            }
-
-            username_buffer[received_bytes] = '\0';
-
-            std::thread new_thread(ReadFromClient, ssl_fd, client_fd, client_address, username_buffer, std::ref(client_vector_mutex), std::ref(client_vector));
-            new_thread.detach();
         }
     }
 
-    return 0;
+    {
+        std::lock_guard<std::mutex> lock(client_vector_mutex);
+        RemoveClient(client_vector, client_fd, client_vector_mutex);
+    }
 }
